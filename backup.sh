@@ -1,0 +1,455 @@
+#!/bin/bash
+set -euo pipefail
+
+#############################################
+# Globals (populated from config)
+#############################################
+STORAGE_BOX_HOST=""
+STORAGE_BOX_USER=""
+STORAGE_BOX_PASS=""
+
+BACKUP_NAME=""
+TARGET_FOLDER=""
+ENCRYPTION_PASSWORD=""
+FILES_TO_BACKUP=()
+FILES_TO_EXCLUDE=()
+
+KEEP_DAILY=3
+KEEP_WEEKLY=3
+KEEP_MONTHLY=6
+KEEP_YEARLY=3
+
+# Database backup definitions
+# Format per entry: "container|user|password|db|output_file"
+# - For postgres: db empty = all databases (uses pg_dumpall)
+# - For mysql: password may be empty if not needed; db empty = all databases
+# - For mariadb: password may be empty if not needed; db empty = all databases
+POSTGRES_BACKUPS=()
+MYSQL_BACKUPS=()
+MARIADB_BACKUPS=()
+
+TSTAMP=""
+BACKUP_FILE=""
+BACKUP_FILE_ENCRYPTED=""
+
+#############################################
+# Usage / Help
+#############################################
+print_usage() {
+  cat <<EOF
+Usage:
+  $0 -c <config_file>           Run backup using the given config file
+  $0 --config <config_file>     Same as -c
+  $0 --init <config_file>       Generate a template config file at the given path
+  $0 -h | --help                Show this help message
+
+Examples:
+  # Show help
+  $0 --help
+
+  # Generate a template configuration file
+  $0 --init /etc/backup.conf
+
+  # Run the backup using a configuration file
+  $0 -c /etc/backup.conf
+EOF
+}
+
+#############################################
+# Generate template config
+#############################################
+generate_template_config() {
+  local target="$1"
+  if [ -z "$target" ]; then
+    echo "ERROR: Please provide a path for the template config file." >&2
+    print_usage
+    exit 1
+  fi
+  if [ -e "$target" ]; then
+    echo "ERROR: File already exists: $target" >&2
+    exit 1
+  fi
+
+  cat > "$target" <<'EOF'
+# ============================================================
+# Backup Script Configuration
+# ============================================================
+
+# --- Hetzner Storage Box (or any SFTP/SCP target) ---
+STORAGE_BOX_HOST="u123456.your-storagebox.de"
+STORAGE_BOX_USER="u123456"
+STORAGE_BOX_PASS="your-storagebox-password"
+
+# --- General backup settings ---
+BACKUP_NAME="myserver"
+TARGET_FOLDER="/backups"
+ENCRYPTION_PASSWORD="change-me-to-a-strong-passphrase"
+
+# Files / directories to back up (bash array)
+FILES_TO_BACKUP=(
+  "/data"
+  "/etc"
+)
+
+# Paths to exclude from the tar archive (bash array)
+FILES_TO_EXCLUDE=(
+  "/data/cache"
+  "/data/tmp"
+)
+
+# --- Retention (number of backups to keep per bucket) ---
+KEEP_DAILY=3
+KEEP_WEEKLY=3
+KEEP_MONTHLY=6
+KEEP_YEARLY=3
+
+# --- PostgreSQL backups ---
+# Each entry: "container|user|password|db|output_file"
+#   - password: may be empty if container trusts local connections
+#   - db: leave empty to dump all databases (uses pg_dumpall)
+POSTGRES_BACKUPS=(
+  "server-db-1|postgres||db1|/data/backup/db/db1.backup"
+  "server-db-1|postgres||db2|/data/backup/db/db2.backup"
+)
+
+# --- MySQL backups ---
+# Each entry: "container|user|password|db|output_file"
+#   - db: leave empty to dump all databases
+#   - output_file: where the dump will be written (must be inside FILES_TO_BACKUP)
+MYSQL_BACKUPS=(
+  "example-mysql-1|root|123456||/data/backup/db/mysql.backup"
+)
+
+# --- MariaDB backups ---
+# Each entry: "container|user|password|db|output_file"
+#   - db: leave empty to dump all databases
+#   - output_file: where the dump will be written (must be inside FILES_TO_BACKUP)
+MARIADB_BACKUPS=(
+  "example-mariadb-1|root|123456|db1|/data/backup/db/mariadb-db1.backup"
+)
+
+EOF
+
+  echo "Template config written to: $target"
+  echo "Edit it and run: $0 -c $target"
+}
+
+#############################################
+# Argument parsing
+#############################################
+CONFIG_FILE=""
+parse_args() {
+  if [ $# -eq 0 ]; then
+    print_usage
+    exit 1
+  fi
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help)
+        print_usage
+        exit 0
+        ;;
+      --init)
+        shift
+        generate_template_config "${1:-}"
+        exit 0
+        ;;
+      -c|--config)
+        shift
+        CONFIG_FILE="${1:-}"
+        ;;
+      *)
+        echo "Unknown argument: $1" >&2
+        print_usage
+        exit 1
+        ;;
+    esac
+    shift || true
+  done
+
+  if [ -z "$CONFIG_FILE" ]; then
+    echo "ERROR: No config file provided." >&2
+    print_usage
+    exit 1
+  fi
+  if [ ! -f "$CONFIG_FILE" ]; then
+    echo "ERROR: Config file not found: $CONFIG_FILE" >&2
+    exit 1
+  fi
+}
+
+load_config() {
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+
+  TSTAMP=$(date "+%Y-%m-%d_%H-%M-%S")
+  BACKUP_FILE="/tmp/${BACKUP_NAME}-backup-${TSTAMP}.tar.gz"
+  BACKUP_FILE_ENCRYPTED="${BACKUP_FILE}-v1.gpg"
+  REMOTE_FILE="backup-${TSTAMP}.tar.gz.gpg"
+}
+
+#############################################
+# Setup dependencies
+#############################################
+install_package() {
+  if command -v apt &>/dev/null; then
+    apt update -y && apt install -y "$1"
+  elif command -v yum &>/dev/null; then
+    yum install -y "$1"
+  else
+    echo "WARNING: No supported package manager found to install $1" >&2
+  fi
+}
+
+setup_dependencies() {
+  if ! command -v sshpass &>/dev/null; then
+    echo "Installing sshpass..."
+    install_package sshpass
+  fi
+  if ! command -v gpg &>/dev/null; then
+    echo "Installing gpg..."
+    install_package gnupg
+  fi
+
+  mkdir -p ~/.ssh
+  touch ~/.ssh/known_hosts
+  if ! ssh-keygen -F "$STORAGE_BOX_HOST" >/dev/null 2>&1; then
+    echo "Adding $STORAGE_BOX_HOST to known_hosts..."
+    ssh-keyscan -H "$STORAGE_BOX_HOST" >> ~/.ssh/known_hosts 2>/dev/null
+  fi
+}
+
+#############################################
+# Database backups
+#############################################
+backup_postgres_entry() {
+  local entry="$1"
+  IFS='|' read -r container user password db output <<< "$entry"
+
+  if [ -z "$container" ] || [ -z "$user" ] || [ -z "$output" ]; then
+    echo "ERROR: Invalid POSTGRES_BACKUPS entry: $entry" >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$output")"
+
+  local pw_env=()
+  if [ -n "$password" ]; then
+    pw_env=(-e "PGPASSWORD=$password")
+  fi
+
+  if [ -z "$db" ]; then
+    echo "Postgres dumpall: container=$container -> $output"
+    docker exec "${pw_env[@]}" "$container" pg_dumpall -U "$user" > "$output"
+  else
+    echo "Postgres dump: container=$container db=$db -> $output"
+    docker exec "${pw_env[@]}" "$container" pg_dump -U "$user" "$db" -Fc > "$output"
+  fi
+}
+
+backup_mysql_entry() {
+  local entry="$1"
+  IFS='|' read -r container user password db output <<< "$entry"
+
+  if [ -z "$container" ] || [ -z "$user" ] || [ -z "$output" ]; then
+    echo "ERROR: Invalid MYSQL_BACKUPS entry: $entry" >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$output")"
+
+  local db_args="--all-databases"
+  if [ -n "$db" ]; then
+    db_args="$db"
+  fi
+
+  echo "MySQL dump: container=$container db=${db:-ALL} -> $output"
+  if [ -n "$password" ]; then
+    docker exec "$container" sh -c "mysqldump -u$user -p\"$password\" $db_args"  > "$output"
+  else
+    docker exec "$container" sh -c "mysqldump -u$user $db_args" > "$output"
+  fi
+}
+
+backup_mariadb_entry() {
+  local entry="$1"
+  IFS='|' read -r container user password db output <<< "$entry"
+
+  if [ -z "$container" ] || [ -z "$user" ] || [ -z "$output" ]; then
+    echo "ERROR: Invalid MARIADB_BACKUPS entry: $entry" >&2
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$output")"
+
+  local db_args="--all-databases"
+  if [ -n "$db" ]; then
+    db_args="$db"
+  fi
+
+  echo "MariaDB dump: container=$container db=${db:-ALL} -> $output"
+  if [ -n "$password" ]; then
+    docker exec "$container" sh -c "mariadb-dump -u$user -p\"$password\" $db_args"  > "$output"
+  else
+    docker exec "$container" sh -c "mariadb-dump -u$user $db_args" > "$output"
+  fi
+}
+
+backup_databases() {
+  for entry in "${POSTGRES_BACKUPS[@]:-}"; do
+    [ -z "$entry" ] && continue
+    backup_postgres_entry "$entry"
+  done
+  for entry in "${MYSQL_BACKUPS[@]:-}"; do
+    [ -z "$entry" ] && continue
+    backup_mysql_entry "$entry"
+  done
+  for entry in "${MARIADB_BACKUPS[@]:-}"; do
+    [ -z "$entry" ] && continue
+    backup_mariadb_entry "$entry"
+  done
+}
+
+#############################################
+# Archive + encrypt
+#############################################
+create_archive() {
+  local tar_exclude_options=()
+  for exclude in "${FILES_TO_EXCLUDE[@]:-}"; do
+    [ -z "$exclude" ] && continue
+    tar_exclude_options+=(--exclude="$exclude")
+  done
+
+  echo "Creating archive: $BACKUP_FILE"
+  tar -czf "$BACKUP_FILE" "${tar_exclude_options[@]}" "${FILES_TO_BACKUP[@]}"
+}
+
+encrypt_archive() {
+  echo "Encrypting archive: $BACKUP_FILE_ENCRYPTED"
+  echo "$ENCRYPTION_PASSWORD" | gpg --batch --yes --passphrase-fd 0 \
+    -o "$BACKUP_FILE_ENCRYPTED" -c "$BACKUP_FILE"
+}
+
+create_backup() {
+  backup_databases
+  create_archive
+  encrypt_archive
+}
+
+#############################################
+# Remote operations
+#############################################
+upload_backup() {
+  echo "Uploading to $STORAGE_BOX_HOST:$TARGET_FOLDER/$REMOTE_FILE"
+  sshpass -p "$STORAGE_BOX_PASS" scp -o StrictHostKeyChecking=no \
+    "$BACKUP_FILE_ENCRYPTED" \
+    "$STORAGE_BOX_USER@$STORAGE_BOX_HOST:$TARGET_FOLDER/$REMOTE_FILE"
+}
+
+remote_exec() {
+  sshpass -p "$STORAGE_BOX_PASS" sftp -r \
+    "$STORAGE_BOX_USER@$STORAGE_BOX_HOST" <<< "$1"
+}
+
+#############################################
+# Retention
+#############################################
+apply_retention() {
+  local all_files
+  all_files=$(remote_exec "ls -1 \"$TARGET_FOLDER\"/" \
+    | grep -E "backup-[0-9]{4}-[0-9]{2}-[0-9]{2}_[0-9]{2}-[0-9]{2}-[0-9]{2}\.tar\.gz\.gpg$" \
+    | sort -r || true)
+
+  if [ -z "$all_files" ]; then
+    echo "No remote backups found; nothing to apply retention to."
+    return
+  fi
+
+  declare -A keep_set kept_buckets
+  declare -A seen_daily seen_weekly seen_monthly seen_yearly
+  local count_daily=0 count_weekly=0 count_monthly=0 count_yearly=0
+
+  while IFS= read -r file; do
+    local ts
+    ts=$(echo "$file" | grep -oP '\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}')
+    local date_part=${ts:0:10}
+    local time_part=${ts:11}
+    local parseable="${date_part} ${time_part//-/:}"
+    local day_bucket year_week_bucket year_month_bucket year_bucket
+    day_bucket=$(date -d "$parseable" +%Y-%m-%d 2>/dev/null)
+    year_week_bucket=$(date -d "$parseable" +%G-%V 2>/dev/null)
+    year_month_bucket=$(date -d "$parseable" +%Y-%m 2>/dev/null)
+    year_bucket=$(date -d "$parseable" +%Y 2>/dev/null)
+
+    if [ "$count_daily" -lt "$KEEP_DAILY" ] && [ -n "$day_bucket" ] && [ -z "${seen_daily[$day_bucket]:-}" ]; then
+      seen_daily[$day_bucket]=1
+      keep_set[$file]=1
+      kept_buckets[$file]="${kept_buckets[$file]:-} daily"
+      count_daily=$((count_daily + 1))
+    fi
+    if [ "$count_weekly" -lt "$KEEP_WEEKLY" ] && [ -n "$year_week_bucket" ] && [ -z "${seen_weekly[$year_week_bucket]:-}" ]; then
+      seen_weekly[$year_week_bucket]=1
+      keep_set[$file]=1
+      kept_buckets[$file]="${kept_buckets[$file]:-} weekly"
+      count_weekly=$((count_weekly + 1))
+    fi
+    if [ "$count_monthly" -lt "$KEEP_MONTHLY" ] && [ -n "$year_month_bucket" ] && [ -z "${seen_monthly[$year_month_bucket]:-}" ]; then
+      seen_monthly[$year_month_bucket]=1
+      keep_set[$file]=1
+      kept_buckets[$file]="${kept_buckets[$file]:-} monthly"
+      count_monthly=$((count_monthly + 1))
+    fi
+    if [ "$count_yearly" -lt "$KEEP_YEARLY" ] && [ -n "$year_bucket" ] && [ -z "${seen_yearly[$year_bucket]:-}" ]; then
+      seen_yearly[$year_bucket]=1
+      keep_set[$file]=1
+      kept_buckets[$file]="${kept_buckets[$file]:-} yearly"
+      count_yearly=$((count_yearly + 1))
+    fi
+  done <<< "$all_files"
+
+  echo "=== Kept Files & Bucket Assignments ==="
+  if [ ${#kept_buckets[@]} -eq 0 ]; then
+    echo "  (No files were kept)"
+  else
+    for file in "${!kept_buckets[@]}"; do
+      local buckets
+      buckets=$(echo "${kept_buckets[$file]}" | sed 's/^ *//;s/ *$//')
+      echo "  $file -> [$buckets]"
+    done | sort
+  fi
+
+  while IFS= read -r file; do
+    if [ -z "${keep_set[$file]:-}" ]; then
+      echo "Deleting old backup: $file"
+      remote_exec "rm $file"
+    fi
+  done <<< "$all_files"
+}
+
+#############################################
+# Cleanup
+#############################################
+cleanup_local() {
+  [ -f "$BACKUP_FILE" ] && rm -f "$BACKUP_FILE"
+  [ -f "$BACKUP_FILE_ENCRYPTED" ] && rm -f "$BACKUP_FILE_ENCRYPTED"
+}
+
+#############################################
+# Main
+#############################################
+main() {
+  parse_args "$@"
+  load_config
+  setup_dependencies
+
+  create_backup
+  upload_backup
+
+  apply_retention
+
+  cleanup_local
+  echo "Backup completed successfully."
+}
+
+main "$@"
