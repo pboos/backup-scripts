@@ -14,10 +14,10 @@ ENCRYPTION_PASSWORD=""
 FILES_TO_BACKUP=()
 FILES_TO_EXCLUDE=()
 
-KEEP_DAILY=3
-KEEP_WEEKLY=3
-KEEP_MONTHLY=6
-KEEP_YEARLY=3
+KEEP_DAILY=7
+KEEP_WEEKLY=4
+KEEP_MONTHLY=12
+KEEP_YEARLY=10
 
 # Database backup definitions
 # Format per entry: "container|user|password|db|output_file"
@@ -27,6 +27,9 @@ KEEP_YEARLY=3
 POSTGRES_BACKUPS=()
 MYSQL_BACKUPS=()
 MARIADB_BACKUPS=()
+
+# Monitoring webhook (optional). If empty, no call is made.
+MONITORING_WEBHOOK_URL=""
 
 TSTAMP=""
 BACKUP_FILE=""
@@ -104,10 +107,10 @@ FILES_TO_EXCLUDE=(
 )
 
 # --- Retention (number of backups to keep per bucket) ---
-KEEP_DAILY=3
-KEEP_WEEKLY=3
-KEEP_MONTHLY=6
-KEEP_YEARLY=3
+KEEP_DAILY=7
+KEEP_WEEKLY=4
+KEEP_MONTHLY=12
+KEEP_YEARLY=10
 
 # --- PostgreSQL backups ---
 # Each entry: "container|user|password|db|output_file"
@@ -133,6 +136,11 @@ MYSQL_BACKUPS=(
 MARIADB_BACKUPS=(
   "example-mariadb-1|root|123456|db1|/data/backup/db/mariadb-db1.backup"
 )
+
+# --- Monitoring (optional) ---
+# If set, this URL will be called via curl after a successful backup.
+# Leave empty to disable.
+MONITORING_WEBHOOK_URL=""
 
 EOF
 
@@ -442,6 +450,24 @@ cleanup_local() {
 }
 
 #############################################
+# Monitoring webhook
+#############################################
+notify_monitoring() {
+  if [ -z "${MONITORING_WEBHOOK_URL:-}" ]; then
+    return 0
+  fi
+  if ! command -v curl &>/dev/null; then
+    echo "WARNING: curl not installed; cannot call monitoring webhook." >&2
+    return 0
+  fi
+  echo "Notifying monitoring webhook: $MONITORING_WEBHOOK_URL"
+  if ! curl -fsS --max-time 30 --retry 3 --retry-delay 2 \
+        "$MONITORING_WEBHOOK_URL" -o /dev/null; then
+    echo "WARNING: Monitoring webhook call failed." >&2
+  fi
+}
+
+#############################################
 # Main
 #############################################
 main() {
@@ -456,6 +482,7 @@ main() {
 
   cleanup_local
   echo "Backup completed successfully."
+  notify_monitoring
 }
 
 main "$@"
