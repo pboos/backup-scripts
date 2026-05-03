@@ -52,8 +52,14 @@ Examples:
 
   # Run the backup using a configuration file
   $0 -c /etc/backup.conf
+
+Restore information:
+  # Postgres db restore:
+  createdb -h localhost -U postgres -T template0 <db>
+  pg_restore -h localhost -U postgres --create --clean -d <db> db.backup
+  
 EOF
-}
+} 
 
 #############################################
 # Generate template config
