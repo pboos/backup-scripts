@@ -82,6 +82,7 @@ generate_template_config() {
   cat > "$target" <<'EOF'
 # ============================================================
 # Backup Script Configuration
+# https://github.com/pboos/backup-scripts
 # ============================================================
 
 # --- Hetzner Storage Box (or any SFTP/SCP target) ---
