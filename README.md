@@ -4,7 +4,7 @@
 
 Install it as a daily cron job
 ```
-curl https://raw.githubusercontent.com/pboos/backup-scripts/refs/heads/main/backup.sh -o /usr/local/bin/backup
+curl https://raw.githubusercontent.com/pboos/backup-scripts/refs/heads/main/backup -o /usr/local/bin/backup
 chmod +x /usr/local/bin/backup
 
 tee /etc/cron.daily/backup <<-'EOF'
