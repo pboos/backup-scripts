@@ -14,6 +14,10 @@ ENCRYPTION_PASSWORD=""
 FILES_TO_BACKUP=()
 FILES_TO_EXCLUDE=()
 
+# Optional custom commands run before and after the backup workflow.
+PRE_BACKUP_COMMANDS=()
+POST_BACKUP_COMMANDS=()
+
 KEEP_DAILY=7
 KEEP_WEEKLY=4
 KEEP_MONTHLY=12
@@ -105,6 +109,17 @@ FILES_TO_BACKUP=(
 FILES_TO_EXCLUDE=(
   "/data/cache"
   "/data/tmp"
+)
+
+# --- Custom commands (optional) ---
+# Commands are run in order by bash. A failing command stops the backup.
+# PRE_BACKUP_COMMANDS run before database dumps, archive creation, encryption, and upload.
+PRE_BACKUP_COMMANDS=(
+  # "docker exec my-app /usr/local/bin/prepare-backup"
+)
+# POST_BACKUP_COMMANDS run only after upload, retention, and local cleanup succeed.
+POST_BACKUP_COMMANDS=(
+  # "docker exec my-app /usr/local/bin/finish-backup"
 )
 
 # --- Retention (number of backups to keep per bucket) ---
@@ -233,6 +248,21 @@ setup_dependencies() {
     echo "Adding $STORAGE_BOX_HOST to known_hosts..."
     ssh-keyscan -H "$STORAGE_BOX_HOST" >> ~/.ssh/known_hosts 2>/dev/null
   fi
+}
+
+#############################################
+# Custom backup commands
+#############################################
+run_commands() {
+  local phase="$1"
+  shift
+  local command
+
+  for command in "$@"; do
+    [ -z "$command" ] && continue
+    echo "Running $phase command: $command"
+    eval "$command"
+  done
 }
 
 #############################################
@@ -476,12 +506,15 @@ main() {
   load_config
   setup_dependencies
 
+  run_commands "pre-backup" "${PRE_BACKUP_COMMANDS[@]:-}"
+
   create_backup
   upload_backup
 
   apply_retention
 
   cleanup_local
+  run_commands "post-backup" "${POST_BACKUP_COMMANDS[@]:-}"
   echo "Backup completed successfully."
   notify_monitoring
 }
