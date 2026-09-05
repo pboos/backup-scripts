@@ -64,9 +64,9 @@ Restore information:
   # Postgres db restore:
   createdb -h localhost -U postgres -T template0 <db>
   pg_restore -h localhost -U postgres --create --clean -d <db> db.backup
-  
+
 EOF
-} 
+}
 
 #############################################
 # Generate template config
@@ -400,7 +400,7 @@ remote_exec() {
 #############################################
 # Retention
 #############################################
-human_size() {
+human_file_size() {
   local bytes="$1"
 
   awk -v bytes="$bytes" 'BEGIN {
@@ -419,18 +419,11 @@ human_size() {
 }
 
 show_remote_usage() {
-  local df_output total used available
-  # `df` uses SFTP's statvfs extension, which is supported by Storage Boxes.
-  # Do not fail a successful backup if another SFTP server does not implement it.
-  df_output=$(remote_exec "df \"$TARGET_FOLDER\"" 2>/dev/null || true)
-  read -r total used available < <(
-    printf '%s\n' "$df_output" | awk '/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+[0-9]+/ { print $1, $2, $3; exit }'
-  ) || true
-
-  if [[ "$total" =~ ^[0-9]+$ && "$used" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]]; then
-    printf 'Remote storage usage: %s used / %s total (%s available)\n' \
-      "$(human_size "$used")" "$(human_size "$total")" "$(human_size "$available")"
-  else
+  # Let SFTP format the filesystem statistics. In particular, Storage Boxes
+  # report their quota correctly here, whereas parsed statvfs values may use
+  # server-specific block units.
+  echo "=== Remote Storage Usage ==="
+  if ! remote_exec "df -h"; then
     echo "WARNING: Could not determine remote storage usage via SFTP." >&2
   fi
 }
@@ -506,7 +499,7 @@ apply_retention() {
     for file in "${!kept_buckets[@]}"; do
       local buckets size
       buckets=$(echo "${kept_buckets[$file]}" | sed 's/^ *//;s/ *$//')
-      size=$(human_size "${file_sizes[$file]:-0}")
+      size=$(human_file_size "${file_sizes[$file]:-0}")
       # The fixed width keeps bucket assignments aligned even as sizes differ.
       printf '  %s (%10s) -> [%s]\n' "$file" "$size" "$buckets"
     done | sort
